@@ -42,15 +42,15 @@ func (h *Handler) HandleSpriteVTT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ─── Step 2: Find thumbnail media ────────────────────────────────────
+	// ─── Step 2: Find first video media ──────────────────────────────────
 	var media models.Media
 	err = models.MediaModel.Col().FindOne(ctx, bson.M{
 		"fileId":    file.ID,
-		"type":      models.MediaTypeThumbnail,
+		"type":      models.MediaTypeVideo,
 		"deletedAt": nil,
 	}).Decode(&media)
 	if err != nil {
-		log.Printf("[Sprite] Thumbnail media not found for fileId=%s: %v", file.ID, err)
+		log.Printf("[Sprite] Video media not found for fileId=%s: %v", file.ID, err)
 		HandleNotFound(w, r)
 		return
 	}
@@ -69,15 +69,15 @@ func (h *Handler) HandleSpriteVTT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storageHostPort := storage.GetHostPort()
-	if storageHostPort == "" {
+	storageHost := storage.GetHost()
+	if storageHost == "" {
 		log.Printf("[Sprite] Storage has no host: %s", storage.ID)
 		HandleNotFound(w, r)
 		return
 	}
 
-	// ─── Step 4: Fetch VTT from storage ──────────────────────────────────
-	vttURL := fmt.Sprintf("http://%s/%s/sprite/sprite.vtt", storageHostPort, file.Slug)
+	// ─── Step 4: Fetch VTT from storage (on-the-fly, port 8889) ─────────
+	vttURL := fmt.Sprintf("http://%s:8889/sprite/%s.json/sprite.vtt", storageHost, media.Slug)
 	vttContent, err := utils.FetchURLContent(ctx, vttURL)
 	if err != nil {
 		log.Printf("[Sprite] Failed to fetch VTT from %s: %v", vttURL, err)
@@ -93,7 +93,7 @@ func (h *Handler) HandleSpriteVTT(w http.ResponseWriter, r *http.Request) {
 	w.Write(responseBody)
 }
 
-// HandleSpriteImage handles GET /{fileSlug}/sprite/{n}.jpg
+// HandleSpriteImage handles GET /{fileSlug}/sprite/sprite-{n}.jpg
 func (h *Handler) HandleSpriteImage(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	parts := strings.SplitN(path, "/sprite/", 2)
@@ -131,11 +131,11 @@ func (h *Handler) HandleSpriteImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ─── Step 2: Find thumbnail media ────────────────────────────────────
+	// ─── Step 2: Find first video media ──────────────────────────────────
 	var media models.Media
 	err = models.MediaModel.Col().FindOne(ctx, bson.M{
 		"fileId":    file.ID,
-		"type":      models.MediaTypeThumbnail,
+		"type":      models.MediaTypeVideo,
 		"deletedAt": nil,
 	}).Decode(&media)
 	if err != nil {
@@ -156,14 +156,14 @@ func (h *Handler) HandleSpriteImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storageHostPort := storage.GetHostPort()
-	if storageHostPort == "" {
+	storageHost := storage.GetHost()
+	if storageHost == "" {
 		HandleNotFound(w, r)
 		return
 	}
 
-	// ─── Step 4: Proxy image from storage ────────────────────────────────
-	sourceURL := fmt.Sprintf("http://%s/%s/sprite/%s", storageHostPort, file.Slug, filename)
+	// ─── Step 4: Proxy image from storage (on-the-fly, port 8889) ───────
+	sourceURL := fmt.Sprintf("http://%s:8889/sprite/%s.json/%s", storageHost, media.Slug, filename)
 
 	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
@@ -205,7 +205,15 @@ func isValidSpriteFilename(filename string) bool {
 	if name == "" {
 		return false
 	}
-	for _, c := range name {
+	// Accept "sprite-{number}" format
+	if !strings.HasPrefix(name, "sprite-") {
+		return false
+	}
+	numPart := strings.TrimPrefix(name, "sprite-")
+	if numPart == "" {
+		return false
+	}
+	for _, c := range numPart {
 		if c < '0' || c > '9' {
 			return false
 		}
