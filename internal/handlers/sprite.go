@@ -28,56 +28,14 @@ func (h *Handler) HandleSpriteVTT(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// ─── Step 1: Find file by slug ───────────────────────────────────────
-	var file models.File
-	err := models.FileModel.Col().FindOne(ctx, bson.M{"slug": slug}).Decode(&file)
+	file, storageHostPort, err := h.resolveSpriteSource(ctx, slug)
 	if err != nil {
-		log.Printf("[Sprite] File not found: %s", slug)
+		log.Printf("[Sprite] VTT resolve failed slug=%s: %v", slug, err)
 		HandleNotFound(w, r)
 		return
 	}
 
-	if file.IsTrashed() || file.IsDeleted() {
-		HandleNotFound(w, r)
-		return
-	}
-
-	// ─── Step 2: Find first video media ──────────────────────────────────
-	var media models.Media
-	err = models.MediaModel.Col().FindOne(ctx, bson.M{
-		"fileId":    file.ID,
-		"type":      models.MediaTypeVideo,
-		"deletedAt": nil,
-	}).Decode(&media)
-	if err != nil {
-		log.Printf("[Sprite] Video media not found for fileId=%s: %v", file.ID, err)
-		HandleNotFound(w, r)
-		return
-	}
-
-	// ─── Step 3: Find storage ────────────────────────────────────────────
-	storageID := ""
-	if media.StorageID != nil {
-		storageID = *media.StorageID
-	}
-
-	var storage models.Storage
-	err = models.StorageModel.Col().FindOne(ctx, bson.M{"_id": storageID}).Decode(&storage)
-	if err != nil {
-		log.Printf("[Sprite] Storage not found: %s", storageID)
-		HandleNotFound(w, r)
-		return
-	}
-
-	storageHost := storage.GetHost()
-	if storageHost == "" {
-		log.Printf("[Sprite] Storage has no host: %s", storage.ID)
-		HandleNotFound(w, r)
-		return
-	}
-
-	// ─── Step 4: Fetch VTT from storage (on-the-fly, port 8889) ─────────
-	vttURL := fmt.Sprintf("http://%s:8889/sprite/%s.json/sprite.vtt", storageHost, media.Slug)
+	vttURL := fmt.Sprintf("http://%s/%s/sprite/sprite.vtt", storageHostPort, file.Slug)
 	vttContent, err := utils.FetchURLContent(ctx, vttURL)
 	if err != nil {
 		log.Printf("[Sprite] Failed to fetch VTT from %s: %v", vttURL, err)
@@ -118,72 +76,20 @@ func (h *Handler) HandleSpriteImage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	// ─── Step 1: Find file by slug ───────────────────────────────────────
-	var file models.File
-	err := models.FileModel.Col().FindOne(ctx, bson.M{"slug": slug}).Decode(&file)
+	file, storageHostPort, err := h.resolveSpriteSource(ctx, slug)
 	if err != nil {
 		HandleNotFound(w, r)
 		return
 	}
 
-	if file.IsTrashed() || file.IsDeleted() {
-		HandleNotFound(w, r)
-		return
-	}
-
-	// ─── Step 2: Find first video media ──────────────────────────────────
-	var media models.Media
-	err = models.MediaModel.Col().FindOne(ctx, bson.M{
-		"fileId":    file.ID,
-		"type":      models.MediaTypeVideo,
-		"deletedAt": nil,
-	}).Decode(&media)
-	if err != nil {
-		HandleNotFound(w, r)
-		return
-	}
-
-	// ─── Step 3: Find storage ────────────────────────────────────────────
-	storageID := ""
-	if media.StorageID != nil {
-		storageID = *media.StorageID
-	}
-
-	var storage models.Storage
-	err = models.StorageModel.Col().FindOne(ctx, bson.M{"_id": storageID}).Decode(&storage)
-	if err != nil {
-		HandleNotFound(w, r)
-		return
-	}
-
-	storageHost := storage.GetHost()
-	if storageHost == "" {
-		HandleNotFound(w, r)
-		return
-	}
-
-	// ─── Step 4: Proxy image from storage (on-the-fly, port 8889) ───────
-	sourceURL := fmt.Sprintf("http://%s:8889/sprite/%s.json/%s", storageHost, media.Slug, filename)
-
-	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
-	if err != nil {
-		HandleNotFound(w, r)
-		return
-	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(upstreamReq)
+	sourceURL := spriteStorageURL(storageHostPort, file.Slug, filename)
+	resp, err := fetchSpriteImage(ctx, sourceURL)
 	if err != nil {
 		log.Printf("[Sprite] Upstream request failed: %s → %v", sourceURL, err)
 		HandleNotFound(w, r)
 		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		HandleNotFound(w, r)
-		return
-	}
 
 	w.Header().Set("Content-Type", "image/jpeg")
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -197,23 +103,77 @@ func (h *Handler) HandleSpriteImage(w http.ResponseWriter, r *http.Request) {
 	io.CopyBuffer(w, resp.Body, buf)
 }
 
+func (h *Handler) resolveSpriteSource(ctx context.Context, slug string) (*models.File, string, error) {
+	var file models.File
+	if err := models.FileModel.Col().FindOne(ctx, bson.M{"slug": slug}).Decode(&file); err != nil {
+		return nil, "", err
+	}
+	if file.IsTrashed() || file.IsDeleted() {
+		return nil, "", fmt.Errorf("file unavailable")
+	}
+
+	var media models.Media
+	err := models.MediaModel.Col().FindOne(ctx, bson.M{
+		"fileId":    file.ID,
+		"type":      models.MediaTypeThumbnail,
+		"deletedAt": nil,
+	}).Decode(&media)
+	if err != nil {
+		return nil, "", fmt.Errorf("thumbnail media: %w", err)
+	}
+
+	storageID := ""
+	if media.StorageID != nil {
+		storageID = *media.StorageID
+	}
+
+	var storage models.Storage
+	if err := models.StorageModel.Col().FindOne(ctx, bson.M{"_id": storageID}).Decode(&storage); err != nil {
+		return nil, "", fmt.Errorf("storage: %w", err)
+	}
+
+	storageHostPort := storage.GetHostPort()
+	if storageHostPort == "" {
+		return nil, "", fmt.Errorf("storage has no host")
+	}
+
+	return &file, storageHostPort, nil
+}
+
+func spriteStorageURL(hostPort, slug, filename string) string {
+	return fmt.Sprintf("http://%s/%s/sprite/%s", hostPort, slug, filename)
+}
+
+func fetchSpriteImage(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("status %d from %s", resp.StatusCode, url)
+	}
+	return resp, nil
+}
+
 func isValidSpriteFilename(filename string) bool {
-	if !strings.HasSuffix(filename, ".jpg") {
+	if !strings.HasPrefix(filename, "sprite-") || !strings.HasSuffix(filename, ".jpg") {
 		return false
 	}
-	name := strings.TrimSuffix(filename, ".jpg")
-	if name == "" {
+	return isDigitsOnly(strings.TrimSuffix(strings.TrimPrefix(filename, "sprite-"), ".jpg"))
+}
+
+func isDigitsOnly(s string) bool {
+	if s == "" {
 		return false
 	}
-	// Accept "sprite-{number}" format
-	if !strings.HasPrefix(name, "sprite-") {
-		return false
-	}
-	numPart := strings.TrimPrefix(name, "sprite-")
-	if numPart == "" {
-		return false
-	}
-	for _, c := range numPart {
+	for _, c := range s {
 		if c < '0' || c > '9' {
 			return false
 		}
