@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,8 +9,8 @@ import (
 	"server-static/internal/db/database"
 	"server-static/internal/handlers"
 	"server-static/internal/logger"
+	"server-static/internal/middleware"
 	"server-static/internal/services"
-	"context"
 
 	"github.com/joho/godotenv"
 )
@@ -17,13 +18,9 @@ import (
 func main() {
 	log.Println("🚀 Starting Web Content Server")
 
-	// Load .env (optional)
 	_ = godotenv.Load()
-
-	// Load config
 	config.Load()
 
-	// Init file logger (writes to stdout + rotating log file)
 	logCloser, err := logger.Init(config.AppConfig.LogPath)
 	if err != nil {
 		log.Printf("⚠️ File logging disabled: %v", err)
@@ -32,58 +29,47 @@ func main() {
 		log.Printf("📝 Logging to: %s (max 25MB per file)", config.AppConfig.LogPath)
 	}
 
-	// Connect to MongoDB
 	if err := database.Connect(); err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
 	defer database.Disconnect()
 	log.Println("✅ MongoDB connected")
 
-	// Get port from environment or use default
 	port := config.AppConfig.Port
 	if port == "" {
 		port = "8082"
 	}
 
-	// Start Settings Sync Scheduler
 	go services.StartSettingSyncScheduler(context.Background())
 
-	// Initialize handlers
 	h := handlers.NewHandler(handlers.Handler{})
 
-	// Routes
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok","service":"server-static"}`)
 	})
-	http.HandleFunc("/logs", h.HandleLogList)
-	http.HandleFunc("/logs/", h.HandleLogFile)
-	http.HandleFunc("/vast/", h.Vast)
-	http.HandleFunc("/image/", h.ImageAdverts)
-	http.HandleFunc("/script/", h.ScriptAdverts)
-	http.HandleFunc("/", h.Home)
+	mux.HandleFunc("/logs", h.HandleLogList)
+	mux.HandleFunc("/logs/", h.HandleLogFile)
+	mux.HandleFunc("/playlist/", h.PlaylistJSON)
+	mux.HandleFunc("/advert/", h.AdvertJSON)
+	mux.HandleFunc("/vast/", h.Vast)
+	mux.HandleFunc("/image/", h.ImageAdverts)
+	mux.HandleFunc("/script/", h.ScriptAdverts)
+	mux.HandleFunc("/", h.Home)
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: middleware.CORS(mux),
+	}
 
 	fmt.Printf("Server started at http://localhost:%s\n", port)
+	log.Printf("📍 Endpoints:")
+	log.Printf("   GET /playlist/{fileSlug}.json  - JW Player playlist feed")
+	log.Printf("   GET /advert/{adSlug}.json      - Unified advert feed")
 
-	// CORS middleware
-	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Range")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.DefaultServeMux.ServeHTTP(w, r)
-	})
-
-	if err := http.ListenAndServe(":"+port, corsHandler); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Println("Error starting server:", err)
 	}
 }
